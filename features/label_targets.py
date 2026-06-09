@@ -1,94 +1,107 @@
-# features/label_targets.py
 import pandas as pd
 import numpy as np
 import os
 
-def generate_labels(df: pd.DataFrame, atr_multiplier: float = 2.0, max_lookahead: int = 48, spread: float = 0.15) -> pd.DataFrame:
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates the Average True Range (ATR) based on hidden env_ prices."""
+    high_low = df['env_high'] - df['env_low']
+    high_close = np.abs(df['env_high'] - df['env_close'].shift())
+    low_close = np.abs(df['env_low'] - df['env_close'].shift())
+    
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    return true_range.rolling(period).mean()
+
+def generate_labels(df: pd.DataFrame, max_hold: int = 32, rr_ratio: float = 2.0, spread: float = 0.15) -> pd.DataFrame:
     """
-    Sweeps the dataframe to simulate an ATR-based 1:2 RR bracket.
-    Assigns targets: 0 (Hold/Loss), 1 (Long Win), 2 (Short Win).
+    Sweeps the dataset and labels future price action.
+    0 = Hold/Noise, 1 = Long 2R Hit, 2 = Short 2R Hit.
     """
-    print(f"Scanning {len(df)} rows for deterministic bracket resolutions...")
+    print(f"Generating forward-looking labels (Max Hold: {max_hold}, RR: {rr_ratio})...")
+    df = df.copy()
+    
+    # Only calculate ATR if it hasn't been provided (prevents overwriting test mocks)
+    if 'env_atr' not in df.columns:
+        df['env_atr'] = calculate_atr(df)
+    
+    # Extract to fast numpy arrays
+    close_p = df['env_close'].values
+    high_p = df['env_high'].values
+    low_p = df['env_low'].values
+    atr_v = df['env_atr'].values
+    
     targets = np.zeros(len(df), dtype=int)
     
-    # Extract to numpy arrays for significantly faster iteration than pandas .iterrows()
-    highs = df['env_high'].values
-    lows = df['env_low'].values
-    closes = df['env_close'].values
-    atrs = df['env_atr'].values
-
-    # We subtract max_lookahead to prevent index out of bounds at the end of the file
-    for i in range(len(df) - max_lookahead):
-        entry_price = closes[i]
-        atr = atrs[i]
-        
-        if pd.isna(atr) or atr == 0:
+    # Iterate through all rows (except the very end where we can't look ahead)
+    for i in range(len(df) - max_hold):
+        if np.isnan(atr_v[i]):
             continue
-
-        # Mathematical bracket definitions
-        long_entry = entry_price + spread
-        long_sl = long_entry - atr
-        long_tp = long_entry + (atr * atr_multiplier)
-        
-        short_entry = entry_price - spread
-        short_sl = short_entry + atr
-        short_tp = short_entry - (atr * atr_multiplier)
-        
-        long_outcome = 0   # 0 = Pending, 1 = Hit TP, -1 = Hit SL
-        short_outcome = 0
-
-        # Scan the horizon (forward time modeling)
-        for j in range(i + 1, i + max_lookahead):
-            future_high = highs[j]
-            future_low = lows[j]
             
-            # Evaluate Long
-            if long_outcome == 0:
-                if future_low <= long_sl:
-                    long_outcome = -1
-                elif future_high >= long_tp:
-                    long_outcome = 1
+        entry_price = close_p[i]
+        atr = atr_v[i]
+        
+        # Avoid zero-volatility math errors
+        if atr < 0.1: 
+            atr = 0.5
+            
+        # Define strict structural brackets
+        long_tp = entry_price + (atr * rr_ratio) + spread
+        long_sl = entry_price - atr - spread
+        
+        short_tp = entry_price - (atr * rr_ratio) - spread
+        short_sl = entry_price + atr + spread
+        
+        long_valid = True
+        short_valid = True
+        target = 0
+        
+        # Look ahead into the future up to the max holding period
+        for j in range(1, max_hold + 1):
+            future_idx = i + j
+            f_high = high_p[future_idx]
+            f_low = low_p[future_idx]
+            
+            # Evaluate Long Edge
+            if long_valid:
+                if f_low <= long_sl:
+                    long_valid = False 
+                elif f_high >= long_tp:
+                    target = 1 
+                    break 
                     
-            # Evaluate Short
-            if short_outcome == 0:
-                if future_high >= short_sl:
-                    short_outcome = -1
-                elif future_low <= short_tp:
-                    short_outcome = 1
+            # Evaluate Short Edge
+            if short_valid:
+                if f_high >= short_sl:
+                    short_valid = False 
+                elif f_low <= short_tp:
+                    target = 2 
+                    break
                     
-            # Break early if both directions have resolved to save compute
-            if long_outcome != 0 and short_outcome != 0:
-                break
+            # If both directions stopped out, break early to save compute
+            if not long_valid and not short_valid:
+                break 
                 
-        # Resolve the classification
-        # If both miraculously won (massive identical wick in both directions), we label 0 to avoid confusing the network
-        if long_outcome == 1 and short_outcome != 1:
-            targets[i] = 1
-        elif short_outcome == 1 and long_outcome != 1:
-            targets[i] = 2
-        else:
-            targets[i] = 0
-
-    df_out = df.copy()
-    df_out['target'] = targets
-    return df_out
+        targets[i] = target
+        
+    df['target'] = targets
+    
+    # Drop rows where we couldn't calculate ATR or look ahead
+    df_clean = df.dropna().iloc[:-max_hold].copy()
+    
+    print(f"Labeling complete. Longs: {np.sum(df_clean['target'] == 1)} | Shorts: {np.sum(df_clean['target'] == 2)} | Hold/Noise: {np.sum(df_clean['target'] == 0)}")
+    return df_clean
 
 if __name__ == "__main__":
     input_path = '../data/processed/master_features_15m.csv'
     output_path = '../data/processed/labeled_features_15m.csv'
     
     if os.path.exists(input_path):
-        df = pd.read_csv(input_path, index_col=0)
-        labeled_df = generate_labels(df)
+        print("Loading master features...")
+        df = pd.read_csv(input_path, index_col='time' if 'time' in pd.read_csv(input_path, nrows=0).columns else 0)
         
-        # Verify distribution
-        counts = labeled_df['target'].value_counts()
-        print("\nTarget Distribution:")
-        print(f"0 (Hold/Fail): {counts.get(0, 0)}")
-        print(f"1 (Long Win):  {counts.get(1, 0)}")
-        print(f"2 (Short Win): {counts.get(2, 0)}")
+        df_labeled = generate_labels(df, max_hold=32, rr_ratio=2.0)
         
-        labeled_df.to_csv(output_path)
-        print(f"\nSaved labeled dataset to {output_path}")
+        df_labeled.to_csv(output_path)
+        print(f"Labeled dataset saved to {output_path}")
     else:
         print(f"File not found: {input_path}")
