@@ -55,7 +55,7 @@ class HybridTradingEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
         # --- OBSERVATION SPACE ---
-        self.observation_space = spaces.Box(low=0.0, high=5.0, shape=(5,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0.0, high=100.0, shape=(7,), dtype=np.float32)
         
         self.initial_balance = initial_balance
         self.balance = self.initial_balance
@@ -121,7 +121,18 @@ class HybridTradingEnv(gym.Env):
         equity_ratio = info["equity"] / self.initial_balance
         drawdown_pct = (self.peak_equity - info["equity"]) / self.peak_equity
         
-        return np.array([equity_ratio, drawdown_pct, probs[0], probs[1], probs[2]], dtype=np.float32)
+        # Fetch current ATR to give the manager volatility context
+        current_atr = self.df.loc[self.current_step, 'env_atr']
+        
+        return np.array([
+            equity_ratio, 
+            drawdown_pct, 
+            probs[0], 
+            probs[1], 
+            probs[2], 
+            current_atr, 
+            self.bars_held
+        ], dtype=np.float32)
 
     def _get_info(self):
         current_price = self.df.loc[self.current_step, 'env_close']
@@ -149,18 +160,66 @@ class HybridTradingEnv(gym.Env):
         current_atr = self.df.loc[self.current_step, 'env_atr']
         
         reward = 0.0
-        
         trade_closed_this_step = False 
         
-        # Position Entry
+        # ==========================================
+        # 1. MANAGE ACTIVE POSITIONS (THE MISSING LOGIC)
+        # ==========================================
+        if self.position != 0:
+            self.bars_held += 1
+            
+            # Check LONG Exits
+            if self.position == 1:
+                if current_low <= self.sl_price:
+                    pnl = (self.sl_price - self.entry_price) * self.position_size 
+                    reward += pnl
+                    self.balance += pnl
+                    trade_closed_this_step = True
+                elif current_high >= self.tp_price:
+                    pnl = (self.tp_price - self.entry_price) * self.position_size 
+                    reward += pnl
+                    self.balance += pnl
+                    trade_closed_this_step = True
+
+            # Check SHORT Exits
+            elif self.position == -1:
+                if current_high >= self.sl_price:
+                    pnl = (self.entry_price - self.sl_price) * self.position_size 
+                    reward += pnl
+                    self.balance += pnl
+                    trade_closed_this_step = True
+                elif current_low <= self.tp_price:
+                    pnl = (self.entry_price - self.tp_price) * self.position_size 
+                    reward += pnl
+                    self.balance += pnl
+                    trade_closed_this_step = True
+            
+            # Force close if held beyond maximum structural tolerance
+            if not trade_closed_this_step and self.bars_held >= self.max_hold:
+                if self.position == 1:
+                    pnl = (current_price - self.entry_price) * self.position_size
+                else:
+                    pnl = (self.entry_price - current_price) * self.position_size
+                reward += pnl
+                self.balance += pnl
+                trade_closed_this_step = True
+
+            # Reset state if trade exited
+            if trade_closed_this_step:
+                self.position = 0
+                self.position_size = 0.0
+                self.bars_held = 0
+
+        # ==========================================
+        # 2. EVALUATE NEW ENTRIES
+        # ==========================================
         if self.position == 0 and not trade_closed_this_step:
             direction_action = action[0] 
             tp_mult_action = action[1] 
             
-            # THE FIX: Lower the threshold so the initial network can actually trigger a trade.
+            # Lowered threshold to bypass Deadzone Trap
             if abs(direction_action) > 0.25: 
                 
-                # Maintain the strict, conservative risk profile you set up earlier!
                 risk_pct = np.interp(abs(direction_action), [0.25, 1.0], [0.005, 0.02])
                 risk_dollar_amount = self.balance * risk_pct
                 
@@ -184,17 +243,23 @@ class HybridTradingEnv(gym.Env):
                     self.tp_price = self.entry_price - (current_atr * tp_multiplier)
                 self.bars_held = 0
             else:
-                reward += 0.01
+                # Removed the +0.01 arbitrary reward for holding idle
+                reward += 0.0
 
+        # ==========================================
+        # 3. GLOBAL STATE & METRICS
+        # ==========================================
         info = self._get_info()
         
         if info["equity"] > self.peak_equity:
             self.peak_equity = info["equity"]
             
+        # Hard Stop / Margin Call Parameter
         if info["equity"] <= (self.initial_balance * 0.90):
             terminated = True
             reward -= (self.initial_balance * 0.10) 
 
+        # Reward Scaling for stable SAC gradients
         scaled_reward = reward / self.initial_balance
         scaled_reward = scaled_reward * 10.0
         scaled_reward = np.clip(scaled_reward, -1.0, 1.0)
