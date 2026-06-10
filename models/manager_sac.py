@@ -77,9 +77,10 @@ def train_manager(data_path: str, oracle_path: str, scaler_path: str, total_time
 
 if __name__ == "__main__":
     train_manager(
-        data_path='../data/processed/master_features_15m.csv', 
+        data_path='../data/processed/master_features_15m.csv',
         oracle_path='./oracle_lstm.pth',
         scaler_path='./oracle_scaler.npz',
-        total_timesteps=150000, 
+        total_timesteps=1000000,
+        # total_timesteps=10000,
         session='LONDON'
     )

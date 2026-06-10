@@ -172,25 +172,25 @@ class HybridTradingEnv(gym.Env):
             if self.position == 1:
                 if current_low <= self.sl_price:
                     pnl = (self.sl_price - self.entry_price) * self.position_size 
-                    reward += pnl
                     self.balance += pnl
+                    reward += pnl  # Normal penalty for a loss
                     trade_closed_this_step = True
                 elif current_high >= self.tp_price:
                     pnl = (self.tp_price - self.entry_price) * self.position_size 
-                    reward += pnl
                     self.balance += pnl
+                    reward += (pnl * 2.0)  # 🔥 ASYMMETRIC REWARD: 2x multiplier for winning
                     trade_closed_this_step = True
 
             # Check SHORT Exits
             elif self.position == -1:
                 if current_high >= self.sl_price:
                     pnl = (self.entry_price - self.sl_price) * self.position_size 
-                    reward += pnl
                     self.balance += pnl
+                    reward += pnl  # Normal penalty for a loss
                     trade_closed_this_step = True
                 elif current_low <= self.tp_price:
                     pnl = (self.entry_price - self.tp_price) * self.position_size 
-                    reward += pnl
+                    reward += (pnl * 2.0)  # 🔥 ASYMMETRIC REWARD: 2x multiplier for winning
                     self.balance += pnl
                     trade_closed_this_step = True
             
@@ -243,8 +243,16 @@ class HybridTradingEnv(gym.Env):
                     self.tp_price = self.entry_price - (current_atr * tp_multiplier)
                 self.bars_held = 0
             else:
-                # Removed the +0.01 arbitrary reward for holding idle
-                reward += 0.0
+                # Agent chose to hold cash. 
+                # Check if the Oracle was highly confident we should have traded.
+                oracle_long_prob = self._next_observation()[3] # Index of Long Prob
+                oracle_short_prob = self._next_observation()[4] # Index of Short Prob
+                
+                if max(oracle_long_prob, oracle_short_prob) > 0.85:
+                    # 🔥 MISSED OPPORTUNITY STING: Penalize ignoring a golden setup
+                    reward -= (self.initial_balance * 0.0005) 
+                else:
+                    reward += 0.0
 
         # ==========================================
         # 3. GLOBAL STATE & METRICS
