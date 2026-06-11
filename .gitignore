@@ -13,3 +13,4 @@ sac_manager_tensorboard_london
 master_diagnostic_log.txt
 exported_metrics
 chore.md
+logs/
